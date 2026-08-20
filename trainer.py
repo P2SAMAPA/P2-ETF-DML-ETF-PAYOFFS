@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from data_manager import load_master_data, prepare_features
+from data_manager import load_master_data, validate_data, prepare_features
 from differential_layers import DifferentialNetwork
 from execution_models import ExecutionCostCalculator
 from payoff_functions import DiscontinuityAwareLoss
@@ -38,6 +38,7 @@ def run_trainer() -> Dict:
     logger.info("🔄 Loading data...")
     try:
         prices_df, macro_df = load_master_data()
+        validate_data(prices_df, macro_df)
     except Exception as e:
         logger.error(f"Failed to load data: {e}")
         return {}
@@ -62,7 +63,7 @@ def run_trainer() -> Dict:
         if not available:
             continue
         
-        # Prepare features
+        # Prepare features using prices
         X, y, volumes, volatilities = prepare_features(
             prices_df[available], macro_df
         )
