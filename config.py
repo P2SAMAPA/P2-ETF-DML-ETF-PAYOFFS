@@ -6,14 +6,14 @@ import os
 
 # HuggingFace
 HF_TOKEN = os.environ.get("HF_TOKEN")
-RESULTS_REPO = "P2SAMAPA/p2-dml-etf-payoffs-results"
 DATA_REPO = "P2SAMAPA/fi-etf-macro-signal-master-data"
+RESULTS_REPO = "P2SAMAPA/p2-dml-etf-payoffs-results"
 
 # Universes
 UNIVERSES = {
     "FI_COMMODITIES": ["TLT", "VCIT", "LQD", "HYG", "VNQ", "GLD", "SLV"],
-    "EQUITY_SECTORS": ["SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "GDX", "XME", "IWF", "XSD", "SOXX", "SMH", "URA", "XBI", "IWM", "IWD", "VUG", "VTV", "SPYG", "QUAL", "IWR", "VO", "VB", "VIG", "VEA", "VGT", "VDE", "XLC", "IBB","IWO", "XLB", "XLRE"],
-    "COMBINED": ["TLT", "VCIT", "LQD", "HYG", "VNQ", "GLD", "SLV", "SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "GDX", "XME", "IWF", "XSD", "SOXX", "SMH", "URA", "XBI", "IWM", "IWD", "IWO", "XLB", "XLRE", "VUG", "VTV", "SPYG", "QUAL", "IWR", "VO", "VB", "VIG", "VEA", "VGT", "VDE", "XLC", "IBB"],
+    "EQUITY_SECTORS": ["SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "GDX", "XME", "IWF", "XSD", "SOXX", "SMH", "URA", "XBI", "IWM", "IWD", "IWO", "XLB", "XLRE"],
+    "COMBINED": ["TLT", "VCIT", "LQD", "HYG", "VNQ", "GLD", "SLV", "SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "GDX", "XME", "IWF", "XSD", "SOXX", "SMH", "URA", "XBI", "IWM", "IWD", "IWO", "XLB", "XLRE"]
 }
 
 # Model parameters
@@ -31,12 +31,12 @@ DML_CONFIG = {
 
 # Execution parameters
 EXECUTION_CONFIG = {
-    "impact_model": "square_root",  # "linear", "square_root", "almgren_chriss"
-    "spread_model": "constant",      # "constant", "volatility_based", "regime_switching"
-    "max_position_pct": 0.02,        # Max position as % of ADV
-    "min_tick_size": 0.01,           # Minimum price increment
-    "execution_horizon": 5,          # Days to execute
-    "risk_aversion": 0.5,            # Risk aversion parameter
+    "impact_model": "square_root",
+    "spread_model": "constant",
+    "max_position_pct": 0.02,
+    "min_tick_size": 0.01,
+    "execution_horizon": 5,
+    "risk_aversion": 0.5,
 }
 
 # Windows for training
