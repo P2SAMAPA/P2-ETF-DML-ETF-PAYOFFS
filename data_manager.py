@@ -1,5 +1,21 @@
 """
 data_manager.py  —  Data loading and feature preparation
+
+FIX vs original (prepare_features):
+  1. The old version collapsed every ticker's next-day return into a single
+     cross-sectional mean (`y_mean`), so the model only ever learned to
+     predict "tomorrow's average return across the whole universe" — one
+     number per day. trainer.py then zipped that one number-per-day against
+     the list of *tickers* to produce "top picks", which is a mismatch: it
+     was never predicting anything ticker-specific. Fixed here by returning
+     a full (n_samples, n_tickers) target matrix Y — one next-day return
+     per ticker — so the model can actually learn per-ticker structure and
+     "top picks" are meaningful.
+  2. Feature normalization was previously done in this function using the
+     full sample's mean/std (including what becomes the validation split
+     later in trainer.py) — a train/validation leakage bug. Normalization
+     is now the caller's responsibility (trainer.py fits it on the train
+     split only and applies the same transform to validation).
 """
 
 import os
@@ -117,42 +133,47 @@ def validate_data(prices: pd.DataFrame, macro: pd.DataFrame) -> None:
 def prepare_features(prices_df: pd.DataFrame, macro_df: pd.DataFrame) -> tuple:
     """
     Prepare features for DML training.
-    Fixed: Properly aligns all arrays.
+
+    Returns:
+        X:          (n_samples, n_tickers) — today's log returns for every
+                    ticker in the universe (unnormalized; caller normalizes
+                    using train-split statistics to avoid leakage).
+        Y:          (n_samples, n_tickers) — next-day log return for EACH
+                    ticker (not the cross-sectional mean), so a model with
+                    output_dim = n_tickers predicts one number per ticker.
+        volumes:    (n_samples,) proxy volume for the day.
+        volatility: (n_samples,) proxy realized volatility for the day.
     """
-    
-    # Calculate returns from prices
+
+    # Calculate log returns from prices
     returns = np.log(prices_df / prices_df.shift(1)).dropna()
-    
+
     if len(returns) < 60:
         raise ValueError(f"Not enough return data: {len(returns)} rows")
-    
-    # Get the number of samples
-    n_samples = len(returns)
-    n_features = len(returns.columns)
-    
-    # Use returns as features - keep as 2D array (samples, features)
-    X = returns.values  # Shape: (n_samples, n_features)
-    
-    # Target: next day return (shift -1)
-    y = returns.shift(-1).values  # Shape: (n_samples, n_features)
-    
-    # For target, we want the mean return across all tickers for each day
-    y_mean = np.nanmean(y, axis=1)  # Shape: (n_samples,)
-    
-    # Remove the last row (where y is NaN from shift)
-    X = X[:-1]  # Shape: (n_samples-1, n_features)
-    y_mean = y_mean[:-1]  # Shape: (n_samples-1,)
-    
-    # Remove any remaining NaN
-    valid = ~np.isnan(y_mean)
+
+    tickers = list(returns.columns)
+
+    # Features: today's returns across all tickers in the universe
+    X_full = returns.values  # (n_days, n_tickers)
+
+    # Targets: next-day return for EACH ticker (shift -1), same shape as X
+    Y_full = returns.shift(-1).values  # (n_days, n_tickers)
+
+    # Drop the last row (target is NaN there because of the shift)
+    X = X_full[:-1]
+    Y = Y_full[:-1]
+
+    # Drop any row where ANY ticker's target is NaN, so every sample has a
+    # fully-populated per-ticker target vector.
+    valid = ~np.isnan(Y).any(axis=1)
     X = X[valid]
-    y_mean = y_mean[valid]
-    
-    # Volumes and volatility (using absolute returns as proxy)
-    volumes = np.abs(X).mean(axis=1) * 1000000
+    Y = Y[valid]
+
+    if len(X) < 60:
+        raise ValueError(f"Not enough valid rows after alignment: {len(X)}")
+
+    # Volume/volatility proxies (per day, broadcast across tickers downstream)
+    volumes = np.abs(X).mean(axis=1) * 1_000_000
     volatility = np.std(X, axis=1)
-    
-    # Normalize features
-    X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-8)
-    
-    return X, y_mean, volumes, volatility
+
+    return X, Y, volumes, volatility, tickers
