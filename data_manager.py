@@ -117,7 +117,7 @@ def validate_data(prices: pd.DataFrame, macro: pd.DataFrame) -> None:
 def prepare_features(prices_df: pd.DataFrame, macro_df: pd.DataFrame) -> tuple:
     """
     Prepare features for DML training.
-    Fixed: Ensures X and y have the same length.
+    Fixed: Properly aligns all arrays.
     """
     
     # Calculate returns from prices
@@ -126,20 +126,27 @@ def prepare_features(prices_df: pd.DataFrame, macro_df: pd.DataFrame) -> tuple:
     if len(returns) < 60:
         raise ValueError(f"Not enough return data: {len(returns)} rows")
     
-    # Use returns as features
-    X = returns.values
+    # Get the number of samples
+    n_samples = len(returns)
+    n_features = len(returns.columns)
     
-    # Target: next day return
-    y = returns.shift(-1).values.flatten()
+    # Use returns as features - keep as 2D array (samples, features)
+    X = returns.values  # Shape: (n_samples, n_features)
+    
+    # Target: next day return (shift -1)
+    y = returns.shift(-1).values  # Shape: (n_samples, n_features)
+    
+    # For target, we want the mean return across all tickers for each day
+    y_mean = np.nanmean(y, axis=1)  # Shape: (n_samples,)
     
     # Remove the last row (where y is NaN from shift)
-    X = X[:-1]
-    y = y[:-1]
+    X = X[:-1]  # Shape: (n_samples-1, n_features)
+    y_mean = y_mean[:-1]  # Shape: (n_samples-1,)
     
     # Remove any remaining NaN
-    valid = ~np.isnan(y)
+    valid = ~np.isnan(y_mean)
     X = X[valid]
-    y = y[valid]
+    y_mean = y_mean[valid]
     
     # Volumes and volatility (using absolute returns as proxy)
     volumes = np.abs(X).mean(axis=1) * 1000000
@@ -148,4 +155,4 @@ def prepare_features(prices_df: pd.DataFrame, macro_df: pd.DataFrame) -> tuple:
     # Normalize features
     X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-8)
     
-    return X, y, volumes, volatility
+    return X, y_mean, volumes, volatility
