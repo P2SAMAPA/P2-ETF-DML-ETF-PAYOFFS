@@ -1,0 +1,36 @@
+name: DML ETF Picks Daily Run
+
+on:
+  schedule:
+    - cron: '10 00 * * 1-6'
+  workflow_dispatch:
+
+jobs:
+  run-dml:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+    
+    - name: Run DML Trainer
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      run: python trainer.py
+    
+    - name: Upload results
+      uses: actions/upload-artifact@v4
+      with:
+        name: dml-results
+        path: dml_results_*.json
+        retention-days: 30
