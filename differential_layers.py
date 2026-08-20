@@ -23,7 +23,7 @@ class DifferentialLayer(nn.Module):
         raise NotImplementedError
 
 
-class DiscontinuityAwareLinear(DifferentialLayer):
+class DiscontinuityAwareLinear(nn.Module):
     """
     Linear layer with discontinuity-aware activation.
     Handles tick size barriers and spread discontinuities.
@@ -31,12 +31,14 @@ class DiscontinuityAwareLinear(DifferentialLayer):
     
     def __init__(self, in_features: int, out_features: int, tick_size: float = 0.01):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(in_features, out_features) * 0.01)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.01)
         self.bias = nn.Parameter(torch.zeros(out_features))
         self.tick_size = tick_size
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Linear transformation
+        # Linear transformation: output = x @ W^T + bias
         out = F.linear(x, self.weight, self.bias)
         
         # Apply tick size discretization (with analytical derivative)
@@ -49,7 +51,6 @@ class DiscontinuityAwareLinear(DifferentialLayer):
         Discretize to tick size with analytical derivative.
         Uses soft rounding for differentiability.
         """
-        # Smooth rounding with temperature
         temperature = 0.01
         rounded = x + temperature * torch.sin(2 * np.pi * x / self.tick_size) / (2 * np.pi)
         return rounded
@@ -62,7 +63,7 @@ class DiscontinuityAwareLinear(DifferentialLayer):
         return 1 + torch.cos(2 * np.pi * x / self.tick_size)
 
 
-class PriceImpactLayer(DifferentialLayer):
+class PriceImpactLayer(nn.Module):
     """
     Price impact model with analytical derivatives.
     Implements square-root impact model.
@@ -78,7 +79,8 @@ class PriceImpactLayer(DifferentialLayer):
         Calculate price impact using square-root model.
         impact = coeff * (order_size / volume)^gamma
         """
-        impact = self.impact_coefficient * (order_size / volume) ** self.gamma
+        ratio = order_size / (volume + 1e-8)
+        impact = self.impact_coefficient * (ratio ** self.gamma)
         return impact
     
     def analytical_derivative(self, order_size: torch.Tensor, volume: torch.Tensor) -> torch.Tensor:
@@ -87,11 +89,11 @@ class PriceImpactLayer(DifferentialLayer):
         d/d(order_size) [coeff * (order_size/volume)^gamma] 
         = coeff * gamma * (order_size/volume)^(gamma-1) * (1/volume)
         """
-        ratio = order_size / volume
-        return self.impact_coefficient * self.gamma * ratio ** (self.gamma - 1) * (1 / volume)
+        ratio = order_size / (volume + 1e-8)
+        return self.impact_coefficient * self.gamma * (ratio ** (self.gamma - 1)) * (1 / (volume + 1e-8))
 
 
-class SpreadLayer(DifferentialLayer):
+class SpreadLayer(nn.Module):
     """
     Bid-ask spread model with regime switching.
     """
@@ -117,7 +119,7 @@ class SpreadLayer(DifferentialLayer):
         return self.vol_scaling * torch.ones_like(volatility)
 
 
-class ExecutionCostLayer(DifferentialLayer):
+class ExecutionCostLayer(nn.Module):
     """
     Total execution cost layer combining impact and spread.
     """
@@ -175,11 +177,8 @@ class DifferentialNetwork(nn.Module):
         dropout_rate = config.get("dropout_rate", 0.1)
         
         self.tick_size = 0.01
-        self.impact_coeff = config.get("impact_coeff", 0.1)
-        self.gamma = config.get("gamma", 0.5)
-        self.base_spread = config.get("base_spread", 0.001)
         
-        # Build layers
+        # Build layers - ensure first layer matches input_dim
         layers = []
         prev_dim = input_dim
         
@@ -191,14 +190,14 @@ class DifferentialNetwork(nn.Module):
         
         self.hidden_layers = nn.Sequential(*layers)
         
-        # Output layer
+        # Output layer - maps from last hidden dim to output_dim
         self.output_layer = DiscontinuityAwareLinear(prev_dim, output_dim, self.tick_size)
         
         # Execution cost layer
         self.execution_layer = ExecutionCostLayer(
-            impact_coeff=self.impact_coeff,
-            gamma=self.gamma,
-            base_spread=self.base_spread
+            impact_coeff=config.get("impact_coeff", 0.1),
+            gamma=config.get("gamma", 0.5),
+            base_spread=config.get("base_spread", 0.001)
         )
         
     def forward(self, x: torch.Tensor, volume: Optional[torch.Tensor] = None,
