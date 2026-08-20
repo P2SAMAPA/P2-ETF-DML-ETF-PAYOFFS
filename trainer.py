@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F  # <-- ADD THIS
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -160,6 +161,7 @@ def run_trainer() -> Dict:
         
         best_val_loss = float('inf')
         epoch_losses = []
+        best_model_state = None
         
         for epoch in range(config.DML_CONFIG["epochs"]):
             epoch_loss = 0.0
@@ -194,7 +196,8 @@ def run_trainer() -> Dict:
                 logger.info(f"    Epoch {epoch}: Train Loss={avg_loss:.6f}, Val Loss={val_loss:.6f}")
         
         # Load best model
-        model.load_state_dict(best_model_state)
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
         
         # Generate picks using validation set (latest data)
         picks = generate_picks(model, X_val[-50:], available, top_n=3)
