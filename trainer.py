@@ -61,15 +61,27 @@ def run_trainer() -> Dict:
         
         available = [t for t in tickers if t in prices_df.columns]
         if not available:
+            logger.warning(f"No tickers available for {universe_name}")
             continue
         
         # Prepare features using prices
-        X, y, volumes, volatilities = prepare_features(
-            prices_df[available], macro_df
-        )
+        try:
+            X, y, volumes, volatilities = prepare_features(
+                prices_df[available], macro_df
+            )
+        except Exception as e:
+            logger.error(f"Failed to prepare features for {universe_name}: {e}")
+            continue
+        
+        # Check shapes
+        logger.info(f"Feature shape: {X.shape}, Target shape: {y.shape}")
+        
+        if len(X) != len(y):
+            logger.error(f"Shape mismatch: X={X.shape}, y={y.shape}")
+            continue
         
         if len(X) < 100:
-            logger.warning(f"Not enough data for {universe_name}")
+            logger.warning(f"Not enough data for {universe_name}: {len(X)} samples")
             continue
         
         # Convert to tensors
@@ -135,7 +147,8 @@ def run_trainer() -> Dict:
             "loss": avg_loss,
             "mse": avg_mse,
             "diff_loss": avg_diff,
-            "tickers": available
+            "tickers": available,
+            "samples": len(X)
         }
     
     # Save results
@@ -144,6 +157,13 @@ def run_trainer() -> Dict:
         json.dump(results, f, indent=2, default=str)
     
     logger.info(f"\n💾 Saved: {output_path}")
+    
+    # Upload to HuggingFace
+    try:
+        from push_results import upload_results
+        upload_results(output_path, hf_token=config.HF_TOKEN)
+    except Exception as e:
+        logger.warning(f"Could not upload results: {e}")
     
     return results
 
