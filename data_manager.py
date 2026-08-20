@@ -117,51 +117,35 @@ def validate_data(prices: pd.DataFrame, macro: pd.DataFrame) -> None:
 def prepare_features(prices_df: pd.DataFrame, macro_df: pd.DataFrame) -> tuple:
     """
     Prepare features for DML training.
-    Expects prices (not returns) from load_master_data.
+    Fixed: Ensures X and y have the same length.
     """
     
     # Calculate returns from prices
     returns = np.log(prices_df / prices_df.shift(1)).dropna()
     
-    # Create feature matrix
-    features = []
+    if len(returns) < 60:
+        raise ValueError(f"Not enough return data: {len(returns)} rows")
     
-    # Price features (returns)
-    for col in returns.columns:
-        features.append(returns[col].values)
-    
-    # Technical features
-    momentum_20 = returns.rolling(20).mean().values
-    momentum_60 = returns.rolling(60).mean().values
-    volatility = returns.rolling(30).std().values
-    
-    # Macro features
-    macro_norm = (macro_df - macro_df.mean()) / macro_df.std()
-    macro_values = macro_norm.values
-    
-    # Combine features
-    X = np.column_stack([
-        returns.values,
-        momentum_20,
-        momentum_60,
-        volatility,
-        macro_values[:len(returns)]
-    ])
+    # Use returns as features
+    X = returns.values
     
     # Target: next day return
     y = returns.shift(-1).values.flatten()
     
-    # Volumes (simplified - use volatility as proxy)
-    volumes = np.abs(returns).values * 1000000  # Simplified volume proxy
+    # Remove the last row (where y is NaN from shift)
+    X = X[:-1]
+    y = y[:-1]
     
-    # Remove NaN
-    valid = ~np.isnan(X).any(axis=1) & ~np.isnan(y)
+    # Remove any remaining NaN
+    valid = ~np.isnan(y)
     X = X[valid]
     y = y[valid]
-    volumes = volumes[valid]
-    volatility = volatility[valid]
     
-    # Normalize
+    # Volumes and volatility (using absolute returns as proxy)
+    volumes = np.abs(X).mean(axis=1) * 1000000
+    volatility = np.std(X, axis=1)
+    
+    # Normalize features
     X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-8)
     
     return X, y, volumes, volatility
