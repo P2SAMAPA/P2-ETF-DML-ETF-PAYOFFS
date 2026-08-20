@@ -1,5 +1,17 @@
 """
 execution_models.py  —  Execution Cost Models with Analytical Derivatives
+
+FIX vs original:
+  ExecutionCostCalculator.calculate_total_cost summed SquareRootImpactModel.impact()
+  (coeff * (order_size/volume)^gamma) AND AlmgrenChrissModel.execution_cost(),
+  whose "temporary impact" term is the *same* square-root functional form
+  (temp_impact * (order_size/daily_volume)^0.5). That double-counts price
+  impact — effectively charging every trade for market impact twice —
+  which systematically overstates execution costs, drags every prediction
+  down after cost-adjustment, and biases picks/training. The corrected
+  version treats the Almgren-Chriss model as the single source of impact +
+  timing-risk cost, and reports the standalone square-root impact only as
+  a diagnostic (not added into total_cost / d_total).
 """
 
 import numpy as np
@@ -12,49 +24,50 @@ class AlmgrenChrissModel:
     """
     Almgren-Chriss optimal execution model with analytical derivatives.
     """
-    
+
     def __init__(self, temp_impact: float = 0.1, perm_impact: float = 0.01,
                  volatility: float = 0.2, risk_aversion: float = 0.5):
         self.temp_impact = temp_impact
         self.perm_impact = perm_impact
         self.volatility = volatility
         self.risk_aversion = risk_aversion
-        
-    def execution_cost(self, order_size: float, volume: float, 
+
+    def execution_cost(self, order_size: float, volume: float,
                        time_horizon: int = 5) -> float:
         """
-        Calculate Almgren-Chriss execution cost.
+        Calculate Almgren-Chriss execution cost
+        (temporary impact + permanent impact + timing/volatility risk cost).
         """
         # Daily volume
         daily_volume = volume / time_horizon
-        
+
         # Temporary impact
         temp_cost = self.temp_impact * (order_size / daily_volume) ** 0.5
-        
+
         # Permanent impact
         perm_cost = self.perm_impact * (order_size / daily_volume)
-        
+
         # Risk cost
         risk_cost = 0.5 * self.risk_aversion * self.volatility ** 2 * time_horizon
-        
+
         return temp_cost + perm_cost + risk_cost
-    
+
     def analytical_gradient(self, order_size: float, volume: float,
                            time_horizon: int = 5) -> Dict:
         """
         Analytical gradient of execution cost.
         """
         daily_volume = volume / time_horizon
-        
+
         # Gradient of temporary impact
         d_temp = self.temp_impact * 0.5 * (order_size / daily_volume) ** (-0.5) * (1 / daily_volume)
-        
+
         # Gradient of permanent impact
         d_perm = self.perm_impact * (1 / daily_volume)
-        
+
         # Gradient of risk cost is zero with respect to order_size
         d_risk = 0.0
-        
+
         return {
             "d_temp": d_temp,
             "d_perm": d_perm,
@@ -66,16 +79,21 @@ class AlmgrenChrissModel:
 class SquareRootImpactModel:
     """
     Square-root price impact model.
+
+    Kept for standalone diagnostics/reporting. NOTE: this uses the same
+    functional form as AlmgrenChrissModel's temporary-impact term, so it
+    should not also be summed into ExecutionCostCalculator.total_cost —
+    see the note there.
     """
-    
+
     def __init__(self, coefficient: float = 0.1, gamma: float = 0.5):
         self.coefficient = coefficient
         self.gamma = gamma
-        
+
     def impact(self, order_size: float, volume: float) -> float:
         """Calculate price impact."""
         return self.coefficient * (order_size / volume) ** self.gamma
-    
+
     def analytical_gradient(self, order_size: float, volume: float) -> float:
         """Analytical gradient of impact."""
         ratio = order_size / volume
@@ -86,10 +104,10 @@ class LiquidityBarrier:
     """
     Models liquidity barriers where execution becomes discontinuous.
     """
-    
+
     def __init__(self, barrier_depth: float = 0.01):
         self.barrier_depth = barrier_depth
-        
+
     def barrier_function(self, position: float, volume: float) -> float:
         """
         Liquidity barrier function.
@@ -100,10 +118,10 @@ class LiquidityBarrier:
         k = 100  # Smoothing parameter
         barrier = 1 / (1 + np.exp(-k * (position_pct - self.barrier_depth)))
         return barrier
-    
+
     def analytical_derivative(self, position: float, volume: float) -> float:
         """
-        Analytical derivative of barrier function.
+        Analytical derivative of barrier function w.r.t. position.
         """
         position_pct = position / volume
         k = 100
@@ -116,7 +134,7 @@ class ExecutionCostCalculator:
     """
     Combined execution cost calculator with analytical derivatives.
     """
-    
+
     def __init__(self, config: Dict):
         self.config = config
         self.impact_model = SquareRootImpactModel(
@@ -132,43 +150,53 @@ class ExecutionCostCalculator:
         self.liquidity_barrier = LiquidityBarrier(
             barrier_depth=config.get("barrier_depth", 0.01)
         )
-    
+
     def calculate_total_cost(self, order_size: float, volume: float,
                             volatility: float, position: float) -> Dict:
         """
         Calculate total execution cost with all components.
+
+        total_cost = ac_cost (temp impact + perm impact + timing risk)
+                     + barrier penalty
+
+        `impact` (standalone square-root impact) is reported for
+        diagnostics only and is NOT added into total_cost, because
+        ac_cost's temp_cost term already is a square-root impact cost —
+        summing both double-counts market impact.
         """
-        # Price impact
+        # Price impact (diagnostic only — do not add into total_cost)
         impact = self.impact_model.impact(order_size, volume)
-        
-        # Almgren-Chriss cost
+
+        # Almgren-Chriss cost (already includes temp + perm impact + risk)
         ac_cost = self.almgren_chriss.execution_cost(order_size, volume)
-        
+
         # Liquidity barrier
         barrier = self.liquidity_barrier.barrier_function(position, volume)
-        
-        # Total cost = impact + AC cost + barrier penalty
-        total_cost = impact + ac_cost + barrier * 0.01  # 1% penalty for barrier breach
-        
+
+        # Total cost = AC cost (impact + risk) + barrier penalty
+        total_cost = ac_cost + barrier * 0.01  # 1% penalty for barrier breach
+
         return {
             "impact": impact,
             "ac_cost": ac_cost,
             "barrier": barrier,
             "total_cost": total_cost
         }
-    
+
     def analytical_gradients(self, order_size: float, volume: float,
                             volatility: float, position: float) -> Dict:
         """
         Analytical gradients of all cost components.
+        d_total mirrors calculate_total_cost: it does not double-count
+        d_impact, since ac_cost's d_temp already covers impact sensitivity.
         """
         d_impact = self.impact_model.analytical_gradient(order_size, volume)
         d_ac = self.almgren_chriss.analytical_gradient(order_size, volume)
         d_barrier = self.liquidity_barrier.analytical_derivative(position, volume)
-        
+
         return {
             "d_impact": d_impact,
             "d_ac": d_ac,
             "d_barrier": d_barrier,
-            "d_total": d_impact + d_ac["d_total"] + d_barrier * 0.01
+            "d_total": d_ac["d_total"] + d_barrier * 0.01
         }
