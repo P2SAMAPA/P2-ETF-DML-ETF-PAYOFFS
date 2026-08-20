@@ -45,27 +45,27 @@ def load_data():
     # Try HuggingFace
     try:
         repo_id = "P2SAMAPA/p2-dml-etf-payoffs-results"
-        files_url = f"https://huggingface.co/api/datasets/{repo_id}/refs/main"
-        response = requests.get(files_url, timeout=10)
-        if response.status_code == 200:
-            files = response.json()
-            json_files = [f for f in files if f.endswith('.json') and f.startswith('dml_results_')]
-            if json_files:
-                latest = sorted(json_files)[-1]
-                data_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{latest}"
-                data_response = requests.get(data_url, timeout=10)
-                if data_response.status_code == 200:
-                    return data_response.json()
+        # First try to get the latest file by date pattern
+        today = datetime.now().strftime("%Y-%m-%d")
+        for date in [today, (datetime.now() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")]:
+            filename = f"dml_results_{date}.json"
+            data_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{filename}"
+            response = requests.get(data_url, timeout=10)
+            if response.status_code == 200:
+                return response.json()
     except:
         pass
     
-    # Try local
+    # Try local files
     try:
         json_files = glob.glob("dml_results_*.json")
         if json_files:
             latest = sorted(json_files)[-1]
             with open(latest, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                # Check if it has top_picks data
+                if "top_picks" in data and data["top_picks"]:
+                    return data
     except:
         pass
     
@@ -104,13 +104,21 @@ def main():
     st.markdown('<div class="main-header">📈 P2-DML-ETF-PICKS</div>', unsafe_allow_html=True)
     st.markdown("*Differential Machine Learning: Top ETF Picks for Next Trading Day*")
     
+    # Try to load data
     data = load_data()
     
     if not data:
         st.error("⚠️ No data available. Please run the trainer first.")
         st.info("Run `python trainer.py` to generate results.")
-        if st.button("🔄 Retry"):
-            st.rerun()
+        
+        # Check if there are any local files
+        import glob
+        local_files = glob.glob("dml_results_*.json")
+        if local_files:
+            st.info(f"Found local files: {local_files}")
+            if st.button("📂 Load Local File"):
+                st.rerun()
+        
         return
     
     run_date = data.get('run_date', 'Unknown')
@@ -121,6 +129,8 @@ def main():
     
     if not top_picks:
         st.warning("No picks generated. Please run trainer with proper configuration.")
+        # Show what's in the data
+        st.json(data)
         return
     
     # Display picks by universe
@@ -179,6 +189,15 @@ def main():
                 'confidence': 'Confidence'
             }
         )
+    
+    # Show loss metrics for transparency
+    with st.expander("📊 Training Metrics"):
+        for universe, data in data.get('universes', {}).items():
+            st.metric(
+                f"{universe} - Best Loss",
+                f"{data.get('best_val_loss', 0):.6f}",
+                delta=f"{data.get('loss', 0):.6f}"
+            )
     
     st.caption(f"Data as of {run_date} | Powered by Differential Machine Learning")
 
