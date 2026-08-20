@@ -7,7 +7,7 @@ import sys
 import json
 import logging
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 import numpy as np
 import pandas as pd
@@ -32,6 +32,44 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def generate_picks(model, X: np.ndarray, tickers: List[str], 
+                   top_n: int = 3) -> List[Dict]:
+    """Generate top N ETF picks from model predictions."""
+    device = next(model.parameters()).device
+    
+    # Convert to tensor
+    X_t = torch.FloatTensor(X).to(device)
+    
+    # Get predictions
+    model.eval()
+    with torch.no_grad():
+        predictions, _ = model(X_t, None, None)
+    
+    # Convert to numpy
+    preds = predictions.cpu().numpy().flatten()
+    
+    # Create list of (ticker, prediction) pairs
+    ticker_preds = list(zip(tickers, preds))
+    
+    # Sort by prediction (highest first)
+    sorted_picks = sorted(ticker_preds, key=lambda x: x[1], reverse=True)
+    
+    # Take top N
+    top_picks = sorted_picks[:top_n]
+    
+    # Format results
+    results = []
+    for ticker, pred in top_picks:
+        results.append({
+            "ticker": ticker,
+            "expected_return": round(float(pred) * 100, 2),  # Convert to percentage
+            "confidence": "High" if pred > 0.01 else "Medium" if pred > 0.005 else "Low",
+            "rationale": f"DML prediction: {float(pred):.4f}"
+        })
+    
+    return results
+
+
 def run_trainer() -> Dict:
     """Main training orchestrator."""
     
@@ -47,7 +85,8 @@ def run_trainer() -> Dict:
     results = {
         "run_date": run_date,
         "universes": {},
-        "execution_metrics": {}
+        "execution_metrics": {},
+        "top_picks": {}
     }
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -84,11 +123,22 @@ def run_trainer() -> Dict:
             logger.warning(f"Not enough data for {universe_name}: {len(X)} samples")
             continue
         
+        # Split into train and validation
+        split_idx = int(len(X) * 0.8)
+        X_train, X_val = X[:split_idx], X[split_idx:]
+        y_train, y_val = y[:split_idx], y[split_idx:]
+        V_train, V_val = volumes[:split_idx], volumes[split_idx:]
+        Vol_train, Vol_val = volatilities[:split_idx], volatilities[split_idx:]
+        
         # Convert to tensors
-        X_t = torch.FloatTensor(X).to(device)
-        y_t = torch.FloatTensor(y).reshape(-1, 1).to(device)
-        V_t = torch.FloatTensor(volumes).reshape(-1, 1).to(device)
-        Vol_t = torch.FloatTensor(volatilities).reshape(-1, 1).to(device)
+        X_t = torch.FloatTensor(X_train).to(device)
+        y_t = torch.FloatTensor(y_train).reshape(-1, 1).to(device)
+        V_t = torch.FloatTensor(V_train).reshape(-1, 1).to(device)
+        Vol_t = torch.FloatTensor(Vol_train).reshape(-1, 1).to(device)
+        
+        # Validation tensors
+        X_val_t = torch.FloatTensor(X_val).to(device)
+        y_val_t = torch.FloatTensor(y_val).reshape(-1, 1).to(device)
         
         # Create dataset
         dataset = TensorDataset(X_t, y_t, V_t, Vol_t)
@@ -101,55 +151,67 @@ def run_trainer() -> Dict:
             config=config.DML_CONFIG
         ).to(device)
         
-        # Optimizer and loss
+        # Optimizer
         optimizer = optim.Adam(model.parameters(), lr=config.DML_CONFIG["learning_rate"])
-        loss_fn = DiscontinuityAwareLoss(barrier_level=0.05)
         
         # Training loop
-        logger.info(f"  Training {len(dataloader)} batches...")
+        logger.info(f"  Training {len(dataloader)} batches for {config.DML_CONFIG['epochs']} epochs...")
         model.train()
         
+        best_val_loss = float('inf')
         epoch_losses = []
+        
         for epoch in range(config.DML_CONFIG["epochs"]):
             epoch_loss = 0.0
-            epoch_mse = 0.0
-            epoch_diff = 0.0
             
-            for batch_idx, (X_batch, y_batch, V_batch, Vol_batch) in enumerate(dataloader):
+            for X_batch, y_batch, V_batch, Vol_batch in dataloader:
                 optimizer.zero_grad()
                 
-                # Forward pass with execution costs
+                # Forward pass
                 prediction, info = model(X_batch, V_batch, Vol_batch)
                 
-                # Compute differential loss
-                loss_dict = model.compute_differential_loss(
-                    prediction, y_batch, V_batch, Vol_batch
-                )
-                
-                loss = loss_dict["total_loss"]
+                # MSE loss only for training stability
+                loss = F.mse_loss(prediction, y_batch)
                 loss.backward()
                 optimizer.step()
                 
                 epoch_loss += loss.item()
-                epoch_mse += loss_dict["mse_loss"].item()
-                epoch_diff += loss_dict["diff_loss"].item()
             
             avg_loss = epoch_loss / len(dataloader)
-            avg_mse = epoch_mse / len(dataloader)
-            avg_diff = epoch_diff / len(dataloader)
             epoch_losses.append(avg_loss)
             
+            # Validation
+            model.eval()
+            with torch.no_grad():
+                val_pred, _ = model(X_val_t, None, None)
+                val_loss = F.mse_loss(val_pred, y_val_t).item()
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_state = model.state_dict().copy()
+            
             if epoch % 20 == 0:
-                logger.info(f"    Epoch {epoch}: Loss={avg_loss:.6f}, MSE={avg_mse:.6f}, Diff={avg_diff:.6f}")
+                logger.info(f"    Epoch {epoch}: Train Loss={avg_loss:.6f}, Val Loss={val_loss:.6f}")
+        
+        # Load best model
+        model.load_state_dict(best_model_state)
+        
+        # Generate picks using validation set (latest data)
+        picks = generate_picks(model, X_val[-50:], available, top_n=3)
         
         # Store results
         results["universes"][universe_name] = {
             "loss": avg_loss,
-            "mse": avg_mse,
-            "diff_loss": avg_diff,
+            "best_val_loss": best_val_loss,
             "tickers": available,
             "samples": len(X)
         }
+        
+        results["top_picks"][universe_name] = picks
+        
+        logger.info(f"  ✅ Top picks for {universe_name}:")
+        for pick in picks:
+            logger.info(f"     {pick['ticker']}: {pick['expected_return']}% ({pick['confidence']})")
     
     # Save results
     output_path = f"dml_results_{run_date}.json"
