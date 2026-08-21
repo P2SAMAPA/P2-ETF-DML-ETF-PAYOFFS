@@ -53,33 +53,25 @@ logger = logging.getLogger(__name__)
 
 
 def generate_picks(model, x_latest_row: np.ndarray, tickers: List[str],
-                   ticker_vol: np.ndarray, top_n: int = 3) -> List[Dict]:
+                   ticker_vol: np.ndarray, top_n: int = 1,
+                   horizon_days: int = 1) -> List[Dict]:
     """
-    Generate top N ETF picks from the model's forecast for the most recent
-    (already-normalized) feature row. x_latest_row is a single day's
-    feature vector, shape (n_features,), where n_features == len(tickers).
+    Generate top N ETF picks from the model's forecast for the given
+    feature row (should be the TRUE most recent trading day's features —
+    see trainer.py's run_trainer for why that's not simply the training
+    set's last row once horizon > 1).
 
-    ticker_vol: (n_tickers,) each ticker's own recent realized daily
-    volatility (std of raw returns over a trailing window). Used to turn
+    ticker_vol: (n_tickers,) each ticker's own recent realized volatility,
+    matched to the same horizon as the prediction itself (i.e. std of the
+    actual horizon-day-forward return series, not daily vol). Used to turn
     each raw prediction into a z-score — "how many standard deviations of
-    this ticker's normal daily move is the model forecasting" — rather than
-    comparing the raw prediction against a fixed absolute cutoff.
+    this ticker's normal `horizon_days`-day move is the model forecasting"
+    — rather than comparing the raw prediction against a fixed absolute cutoff.
 
-    FIX: confidence was previously "High" if pred > 0.01, "Medium" if
-    pred > 0.005, else "Low" — fixed absolute thresholds calibrated against
-    an early, since-fixed bug that inflated predictions into the 1-7% range.
-    Once predictions were corrected to their honest ~0.1-0.3% scale, every
-    pick fell into "Low" and the label stopped conveying anything. It also
-    silently mishandled negative predictions: a large negative forecast
-    (e.g. -0.05) would hit the same "else" branch as a genuinely
-    unremarkable one, since the comparison only ever checked the upper
-    (positive) side.
-
-    Now confidence is based on |z| = |prediction| / ticker's own recent
-    volatility, which (a) stays meaningful regardless of the model's
-    overall prediction scale, since it's self-normalizing per ticker, and
-    (b) is symmetric, so a large negative forecast is correctly flagged as
-    high-confidence too.
+    Confidence is based on |z| = |prediction| / ticker's own recent
+    (horizon-matched) volatility: High >= 2sigma, Medium >= 1sigma, else Low.
+    Symmetric in sign, so a large negative forecast is correctly flagged as
+    high-confidence too, not lumped in with negligible predictions.
     """
     device = next(model.parameters()).device
 
@@ -106,6 +98,8 @@ def generate_picks(model, x_latest_row: np.ndarray, tickers: List[str],
     sorted_picks = sorted(ticker_preds, key=lambda x: x[1], reverse=True)
     top_picks = sorted_picks[:top_n]
 
+    horizon_label = f"{horizon_days}d" if horizon_days != 1 else "1d"
+
     results = []
     for ticker, pred, vol in top_picks:
         z = float(pred) / (float(vol) + 1e-8)
@@ -113,16 +107,18 @@ def generate_picks(model, x_latest_row: np.ndarray, tickers: List[str],
         confidence = "High" if az >= 2.0 else "Medium" if az >= 1.0 else "Low"
         results.append({
             "ticker": ticker,
+            "horizon_days": horizon_days,
             "expected_return": round(float(pred) * 100, 2),  # Convert to percentage
             "confidence": confidence,
             "z_score": round(z, 2),
             "rationale": (
-                f"DML prediction: {float(pred):.4f} "
-                f"({z:+.2f}\u03c3 vs {ticker}'s recent {vol*100:.2f}% daily vol)"
+                f"DML {horizon_label} forward prediction: {float(pred):.4f} "
+                f"({z:+.2f}\u03c3 vs {ticker}'s recent {horizon_label} realized vol of {vol*100:.2f}%)"
             )
         })
 
     return results
+
 
 
 def run_trainer() -> Dict:
@@ -180,10 +176,15 @@ def run_trainer() -> Dict:
             continue
 
         # Prepare features/targets: X is (n_days, n_tickers), Y is
-        # (n_days, n_tickers) — one target per ticker, per day.
+        # (n_days, n_tickers) — one target per ticker, per day, now the
+        # cumulative return over the next PREDICTION_HORIZON_DAYS days.
+        # latest_row/latest_date are the TRUE most recent day's features —
+        # NOT part of the training set, since with horizon > 1 the training
+        # set's last row is necessarily ~horizon days stale (its target
+        # can't be known until `horizon` future days have actually happened).
         try:
-            X, Y, volumes, volatilities, feature_tickers = prepare_features(
-                prices_df[available], macro_df
+            X, Y, volumes, volatilities, feature_tickers, latest_row_raw, latest_date = prepare_features(
+                prices_df[available], macro_df, horizon=config.PREDICTION_HORIZON_DAYS
             )
         except Exception as e:
             logger.error(f"Failed to prepare features for {universe_name}: {e}")
@@ -333,20 +334,24 @@ def run_trainer() -> Dict:
         if best_model_state is not None:
             model.load_state_dict(best_model_state)
 
-        # Generate picks from the single most recent (normalized) day's
-        # features — an actual forecast for the next trading day. The
-        # forecast is now always the raw (unadjusted) prediction, matching
-        # exactly what was optimized during training.
+        # Generate picks from the TRUE most recent trading day's features
+        # (normalized with the same train-split stats used everywhere else)
+        # — an actual live forecast, not one that's ~horizon days stale.
         #
-        # ticker_vol: each ticker's own recent realized daily volatility,
-        # from the trailing ~63 days of actual (raw, unnormalized) returns
-        # — used to convert each prediction into a z-score for confidence
-        # labeling (see generate_picks docstring).
-        vol_window = min(63, len(Y))
+        # ticker_vol: each ticker's own recent realized volatility OF THE
+        # SAME HORIZON as the target itself (Y is already the cumulative
+        # horizon-day return, so std(Y) directly gives horizon-matched
+        # volatility — no separate daily-vol-times-sqrt(horizon) scaling
+        # needed). The window is widened for longer horizons since Y's rows
+        # overlap heavily (adjacent horizon-day windows share almost all
+        # their days), so more rows are needed for a stable estimate.
+        vol_window = min(max(63, config.PREDICTION_HORIZON_DAYS * 12), len(Y))
         ticker_vol = Y[-vol_window:].std(axis=0)
 
-        latest_row = X_val[-1]
-        picks = generate_picks(model, latest_row, feature_tickers, ticker_vol, top_n=3)
+        latest_row = (latest_row_raw - feat_mean) / feat_std
+        logger.info(f"  Live forecast as of: {latest_date.date()} (horizon: {config.PREDICTION_HORIZON_DAYS}d forward)")
+        picks = generate_picks(model, latest_row, feature_tickers, ticker_vol,
+                               top_n=config.TOP_N_PICKS, horizon_days=config.PREDICTION_HORIZON_DAYS)
 
         # Store results — train_mse is now reported AT the best (saved)
         # epoch, so it's directly comparable to val_mse (previously "loss"
