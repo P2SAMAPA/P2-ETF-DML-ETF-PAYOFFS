@@ -205,6 +205,29 @@ def run_trainer() -> Dict:
         # features in addition to per-ticker returns, so X.shape[1] is no
         # longer equal to the number of tickers being predicted.
         n_tickers = Y.shape[1]
+        n_features = X.shape[1]
+
+        # Effective independent sample count: with a `horizon`-day forward
+        # target, adjacent rows overlap almost entirely (~95% shared days at
+        # horizon=21), so genuinely independent information scales with
+        # samples/horizon, not raw row count. Universes with a poor ratio of
+        # (effective independent samples) to (feature count) get extra L2/
+        # dropout pressure below, scaled to how far short they fall of
+        # config.TARGET_EFFECTIVE_RATIO — verified on the real run that
+        # prompted this: EQUITY_SECTORS had ~171 effective samples vs. 307
+        # features (ratio 0.56) with the old 4-window feature set.
+        effective_independent = len(X) / config.PREDICTION_HORIZON_DAYS
+        sample_feature_ratio = effective_independent / n_features
+        target_ratio = config.TARGET_EFFECTIVE_RATIO
+        if sample_feature_ratio < target_ratio:
+            reg_scale = min(target_ratio / max(sample_feature_ratio, 0.1), config.MAX_REG_SCALE)
+        else:
+            reg_scale = 1.0
+
+        logger.info(
+            f"  Effective independent samples \u2248 {effective_independent:.0f} / {n_features} features "
+            f"(ratio={sample_feature_ratio:.2f}, target={target_ratio}) -> regularization scaled {reg_scale:.2f}x"
+        )
 
         # Split into train and validation FIRST, then normalize using only
         # the train split's statistics (avoids leaking validation info).
@@ -255,23 +278,30 @@ def run_trainer() -> Dict:
         dataloader = DataLoader(dataset, batch_size=config.DML_CONFIG["batch_size"], shuffle=True)
 
         # Initialize model — output_dim = n_tickers so each output neuron
-        # is a per-ticker next-day return forecast.
+        # is a per-ticker next-day return forecast. dropout_rate is scaled
+        # by reg_scale (computed above) for universes with a poor effective-
+        # sample-to-feature ratio, capped at 0.5 so it can't destroy the
+        # network's capacity to learn entirely.
+        per_universe_config = dict(config.DML_CONFIG)
+        base_dropout = config.DML_CONFIG.get("dropout_rate", 0.1)
+        per_universe_config["dropout_rate"] = min(base_dropout * reg_scale, 0.5)
+
         model = DifferentialNetwork(
             input_dim=X.shape[1],
             output_dim=n_tickers,
-            config=config.DML_CONFIG
+            config=per_universe_config
         ).to(device)
 
-        # Optimizer. weight_decay comes from config.DML_CONFIG["l2_reg"] — this
-        # was already defined in config.py but never actually applied anywhere,
-        # meaning the model had zero L2 regularization despite the config
-        # implying otherwise. With ~330 features and only ~1600 samples for
-        # the larger universes, this is very likely why validation loss
-        # peaked within the first 2-3 epochs in practice.
+        # Optimizer. weight_decay comes from config.DML_CONFIG["l2_reg"],
+        # scaled by reg_scale for the same reason as dropout above — this
+        # was already defined in config.py but never actually applied
+        # anywhere, meaning the model had zero L2 regularization despite the
+        # config implying otherwise.
+        scaled_l2 = config.DML_CONFIG.get("l2_reg", 0.0) * reg_scale
         optimizer = optim.Adam(
             model.parameters(),
             lr=config.DML_CONFIG["learning_rate"],
-            weight_decay=config.DML_CONFIG.get("l2_reg", 0.0)
+            weight_decay=scaled_l2
         )
 
         # Training loop
