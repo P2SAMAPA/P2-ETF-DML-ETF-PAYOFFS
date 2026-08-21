@@ -144,7 +144,11 @@ def run_trainer() -> Dict:
             logger.warning(f"Not enough data for {universe_name}: {len(X)} samples")
             continue
 
-        n_tickers = X.shape[1]
+        # IMPORTANT: n_tickers (the model's output_dim) must come from Y's
+        # column count, NOT X's. X now includes macro + rolling-window
+        # features in addition to per-ticker returns, so X.shape[1] is no
+        # longer equal to the number of tickers being predicted.
+        n_tickers = Y.shape[1]
 
         # Split into train and validation FIRST, then normalize using only
         # the train split's statistics (avoids leaking validation info).
@@ -202,7 +206,16 @@ def run_trainer() -> Dict:
                 prediction, info = model(X_batch, V_batch, Vol_batch)
 
                 loss = F.mse_loss(prediction, Y_batch)
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.warning(f"    Non-finite loss encountered at epoch {epoch} — skipping this batch's step")
+                    continue
+
                 loss.backward()
+                # Defensive: clip gradients so a bad batch/parameter regime
+                # can't blow up weights in one step (belt-and-suspenders on
+                # top of the bounded impact/gamma fix in differential_layers.py).
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
                 epoch_loss += loss.item()
