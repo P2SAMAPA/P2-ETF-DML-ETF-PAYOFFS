@@ -67,3 +67,14 @@ WINDOWS = [63, 126, 252, 504]
 # back toward the ~2004-2006 vintage sector ETFs that make up most of the
 # universe, much closer to FI_COMMODITIES's ~15-year window.
 MIN_HISTORY_DAYS = 3500
+
+# Forecast horizon in trading days. The target becomes the cumulative
+# return over the NEXT this-many trading days (e.g. 21 ~= 1 trading month),
+# instead of just tomorrow's return. Longer horizons carry more signal
+# relative to daily noise, which is what lets the model's z-score-based
+# confidence (see trainer.py's generate_picks) actually reach Medium/High
+# rather than being structurally capped near 0 on 1-day-ahead noise.
+PREDICTION_HORIZON_DAYS = 21
+
+# How many top picks to surface per universe.
+TOP_N_PICKS = 1
