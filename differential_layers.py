@@ -270,50 +270,73 @@ class DifferentialNetwork(nn.Module):
     def forward(self, x: torch.Tensor, volume: Optional[torch.Tensor] = None,
                 volatility: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
         """
-        Forward pass with execution cost adjustments.
+        Forward pass.
         x: (batch, input_dim)
-        volume, volatility: (batch, 1) or None
-        Returns prediction: (batch, output_dim)
+        volume, volatility: (batch, 1) or None — only used to compute execution
+        cost DIAGNOSTICS (returned in `info`), never subtracted from the
+        returned prediction.
+
+        FIX: previously, when volume/volatility were given, this method
+        subtracted execution cost from the prediction before returning it,
+        and trainer.py's training loop fit THAT cost-adjusted value against
+        the raw next-day-return target. But generate_picks() (and the
+        original validation code) called forward() WITHOUT volume/
+        volatility, getting the un-adjusted base prediction straight back.
+        Verified by direct reproduction: training forces
+        (base_prediction - cost) ≈ target, so base_prediction ends up
+        biased upward by ≈ the trained-in cost — in a synthetic test with a
+        true target of exactly 0, the "prediction used for picks" converged
+        to 0.00422, matching the trained-in cost (0.00422) almost exactly.
+        That bias is very likely why picks like FI_COMMODITIES showed
+        implausibly large "High confidence" 1.5-1.7% next-day forecasts.
+
+        The prediction returned here is now ALWAYS the raw, unadjusted
+        forecast, identically whether or not volume/volatility are passed —
+        eliminating the train/inference mismatch. Execution cost is still
+        computed (when volume/volatility are given) and returned in `info`
+        for diagnostics, and is used by compute_differential_loss() as a
+        genuine regularization term (penalizing cost SENSITIVITY, not
+        subtracting cost from the forecast).
         """
-        # Base prediction
+        # Base prediction — this is always the return forecast, full stop.
         h = self.hidden_layers(x)
         prediction = self.output_layer(h)  # (batch, output_dim)
 
-        # Apply execution costs if volume and volatility provided
+        info = {"base_prediction": prediction}
+
+        # Execution cost is computed only for diagnostics/regularization —
+        # it is never subtracted from the returned prediction.
         if volume is not None and volatility is not None:
-            # Calculate execution cost per output (per ticker)
             order_size = torch.abs(prediction)  # Simplified: use |predicted return| as proxy for size
             cost, components = self.execution_layer(order_size, volume, volatility)
+            info["execution_cost"] = cost
+            info["components"] = components
 
-            # Adjust prediction for execution costs
-            adjusted_prediction = prediction - cost
-
-            return adjusted_prediction, {
-                "base_prediction": prediction,
-                "execution_cost": cost,
-                "components": components,
-                "adjusted_prediction": adjusted_prediction
-            }
-
-        return prediction, {"base_prediction": prediction}
+        return prediction, info
 
     def compute_differential_loss(self, prediction: torch.Tensor,
                                   target: torch.Tensor,
                                   volume: torch.Tensor,
                                   volatility: torch.Tensor) -> Dict:
         """
-        Compute loss with differential execution cost gradients.
+        The actual "differential loss": standard MSE on the raw prediction
+        vs. raw target, PLUS a regularization term that penalizes high
+        execution-cost SENSITIVITY (the analytical gradient of cost w.r.t.
+        order size) — this is the project's namesake feature. Previously
+        this method existed but was never called anywhere in trainer.py;
+        the training loop called plain F.mse_loss on the cost-ADJUSTED
+        forward output instead, which both skipped this regularizer
+        entirely and caused the bias described in forward()'s docstring.
         """
-        # Standard MSE loss
+        # Standard MSE loss on the raw (unadjusted) prediction
         mse_loss = F.mse_loss(prediction, target)
 
-        # Analytical execution cost gradient
+        # Analytical execution cost gradient (cost sensitivity, not cost itself)
         order_size = torch.abs(prediction)
         gradients = self.execution_layer.analytical_gradient(
             order_size, volume, volatility
         )
 
-        # Differential loss component
         # Penalize high execution cost sensitivity
         diff_loss = torch.mean(gradients["d_total"] ** 2)
 
