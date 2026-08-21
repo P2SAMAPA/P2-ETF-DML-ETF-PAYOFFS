@@ -2,20 +2,36 @@
 data_manager.py  —  Data loading and feature preparation
 
 FIX vs original (prepare_features):
-  1. The old version collapsed every ticker's next-day return into a single
-     cross-sectional mean (`y_mean`), so the model only ever learned to
-     predict "tomorrow's average return across the whole universe" — one
-     number per day. trainer.py then zipped that one number-per-day against
-     the list of *tickers* to produce "top picks", which is a mismatch: it
-     was never predicting anything ticker-specific. Fixed here by returning
-     a full (n_samples, n_tickers) target matrix Y — one next-day return
-     per ticker — so the model can actually learn per-ticker structure and
-     "top picks" are meaningful.
-  2. Feature normalization was previously done in this function using the
-     full sample's mean/std (including what becomes the validation split
-     later in trainer.py) — a train/validation leakage bug. Normalization
-     is now the caller's responsibility (trainer.py fits it on the train
-     split only and applies the same transform to validation).
+  1. [Previous fix, kept] The old version collapsed every ticker's next-day
+     return into a single cross-sectional mean, so the model only ever
+     learned "tomorrow's average return across the universe" — one number
+     per day — while trainer.py zipped that single number against a list
+     of tickers as if it were per-ticker forecasts. Fixed by returning a
+     full (n_samples, n_tickers) target matrix Y — one next-day return per
+     ticker.
+  2. [New] Macro data (VIX, T10Y2Y, DXY, IG_SPREAD, HY_SPREAD) was loaded
+     by load_master_data() but never actually joined into the feature
+     matrix — the model only ever saw same-day returns of the tickers in
+     its own universe, nothing about the macro backdrop. Both macro LEVELS
+     and 1-day CHANGES are now included as features (levels capture regime,
+     changes capture shocks).
+  3. [New] Rolling per-ticker momentum and volatility features are added
+     using the trading-day windows already defined in config.WINDOWS
+     (63/126/252/504 = ~1Q/6M/1Y/2Y). These were defined in config.py but
+     never used anywhere in the codebase.
+  4. [New] The join logic previously required EVERY ticker in a universe
+     to have data on a given day (pandas .dropna() default), so a single
+     late-inception ETF (e.g. XLC launched 2018, XLRE 2015, QUAL 2013)
+     silently forced the ENTIRE universe's training window to start from
+     that ticker's listing date — discarding up to a decade of otherwise
+     usable 2008+ history for every other ticker in the universe. This is
+     unavoidable in a joint multi-ticker prediction (the model needs a
+     complete row to train on), but it is now surfaced explicitly via a
+     log message reporting the actual usable date range and how many
+     candidate rows were dropped and why, so it's visible instead of silent.
+  5. [Previous fix, kept] Feature normalization is the CALLER's
+     responsibility (trainer.py fits it on the train split only), so this
+     function returns raw, unnormalized features.
 """
 
 import os
@@ -130,50 +146,95 @@ def validate_data(prices: pd.DataFrame, macro: pd.DataFrame) -> None:
         logger.warning(f"Only {len(prices)} rows — less than 1 year of data.")
 
 
-def prepare_features(prices_df: pd.DataFrame, macro_df: pd.DataFrame) -> tuple:
+def prepare_features(prices_df: pd.DataFrame, macro_df: pd.DataFrame,
+                      windows: Optional[List[int]] = None) -> tuple:
     """
     Prepare features for DML training.
 
+    Feature matrix X (per day t) includes:
+      - Today's log return for every ticker in the universe
+      - Macro LEVELS at day t (VIX, T10Y2Y, DXY, spreads if available)
+      - Macro 1-day CHANGES at day t (captures shocks, not just regime)
+      - Rolling per-ticker momentum (mean return) for each window in
+        `windows` (default: config.WINDOWS)
+      - Rolling per-ticker volatility (std of returns) for each window
+
+    All rolling/macro features use only data up to and including day t
+    (pandas .rolling()/.diff() are inherently causal), so there is no
+    look-ahead leakage.
+
+    Target Y (per day t): next-day (t+1) log return for EACH ticker —
+    shape (n_samples, n_tickers), matching X's row-days.
+
     Returns:
-        X:          (n_samples, n_tickers) — today's log returns for every
-                    ticker in the universe (unnormalized; caller normalizes
-                    using train-split statistics to avoid leakage).
-        Y:          (n_samples, n_tickers) — next-day log return for EACH
-                    ticker (not the cross-sectional mean), so a model with
-                    output_dim = n_tickers predicts one number per ticker.
-        volumes:    (n_samples,) proxy volume for the day.
-        volatility: (n_samples,) proxy realized volatility for the day.
+        X:          (n_samples, n_features) unnormalized. Caller (trainer.py)
+                    normalizes using train-split-only statistics.
+        Y:          (n_samples, n_tickers)
+        volumes:    (n_samples,) proxy volume for the day, from raw returns only.
+        volatility: (n_samples,) proxy realized volatility, from raw returns only.
+        tickers:    list of ticker names, in the same column order as Y.
     """
+    windows = windows or config.WINDOWS
+    tickers = list(prices_df.columns)
 
-    # Calculate log returns from prices
-    returns = np.log(prices_df / prices_df.shift(1)).dropna()
+    # Daily log returns (today's return per ticker) — the base feature block
+    returns = np.log(prices_df / prices_df.shift(1))
 
-    if len(returns) < 60:
-        raise ValueError(f"Not enough return data: {len(returns)} rows")
+    if returns.dropna(how="all").shape[0] < 60:
+        raise ValueError(f"Not enough return data: {returns.dropna(how='all').shape[0]} rows")
 
-    tickers = list(returns.columns)
+    feature_blocks = [returns.add_suffix("_ret")]
 
-    # Features: today's returns across all tickers in the universe
-    X_full = returns.values  # (n_days, n_tickers)
+    # Rolling per-ticker momentum & volatility across the configured windows
+    for w in windows:
+        mom = returns.rolling(window=w, min_periods=w).mean().add_suffix(f"_mom{w}")
+        vol = returns.rolling(window=w, min_periods=w).std().add_suffix(f"_vol{w}")
+        feature_blocks.append(mom)
+        feature_blocks.append(vol)
 
-    # Targets: next-day return for EACH ticker (shift -1), same shape as X
-    Y_full = returns.shift(-1).values  # (n_days, n_tickers)
+    # Macro features aligned to the same dates: levels + 1-day changes
+    macro_aligned = macro_df.reindex(returns.index)
+    feature_blocks.append(macro_aligned.add_suffix("_lvl"))
+    feature_blocks.append(macro_aligned.diff().add_suffix("_chg"))
 
-    # Drop the last row (target is NaN there because of the shift)
-    X = X_full[:-1]
-    Y = Y_full[:-1]
+    feat_df = pd.concat(feature_blocks, axis=1)
 
-    # Drop any row where ANY ticker's target is NaN, so every sample has a
-    # fully-populated per-ticker target vector.
-    valid = ~np.isnan(Y).any(axis=1)
-    X = X[valid]
-    Y = Y[valid]
+    # Target: next-day return for EACH ticker, same date index as feat_df
+    target_df = returns.shift(-1)
 
-    if len(X) < 60:
-        raise ValueError(f"Not enough valid rows after alignment: {len(X)}")
+    # A row is usable only if every feature AND every target is present.
+    # (This is where a late-inception ticker in the universe, or the
+    # rolling-window warm-up period, or the final row's missing next-day
+    # target, all get excluded.)
+    valid_mask = (~feat_df.isna().any(axis=1)) & (~target_df.isna().any(axis=1))
 
-    # Volume/volatility proxies (per day, broadcast across tickers downstream)
-    volumes = np.abs(X).mean(axis=1) * 1_000_000
-    volatility = np.std(X, axis=1)
+    n_candidate = len(feat_df)
+    n_valid = int(valid_mask.sum())
+
+    if n_valid < 100:
+        raise ValueError(
+            f"Not enough valid rows after feature engineering: {n_valid} "
+            f"(out of {n_candidate} candidate rows). This usually means a "
+            f"ticker in this universe has a much shorter listing history "
+            f"than the rest, or the rolling windows {windows} are too long "
+            f"for the available data."
+        )
+
+    valid_dates = feat_df.index[valid_mask]
+    logger.info(
+        f"  Feature window: {valid_dates.min().date()} → {valid_dates.max().date()} "
+        f"({n_valid} usable rows out of {n_candidate} candidate rows, "
+        f"{n_candidate - n_valid} dropped to warm-up/missing-ticker/macro alignment) "
+        f"| {feat_df.shape[1]} features (returns + rolling mom/vol + macro lvl/chg)"
+    )
+
+    X = feat_df.loc[valid_mask].values
+    Y = target_df.loc[valid_mask].values
+
+    # Volume/volatility proxies for the execution-cost layer: derived from
+    # raw today's-returns only (not the expanded macro/rolling feature set).
+    raw_ret_valid = returns.loc[valid_mask].values
+    volumes = np.abs(raw_ret_valid).mean(axis=1) * 1_000_000
+    volatility = np.std(raw_ret_valid, axis=1)
 
     return X, Y, volumes, volatility, tickers
