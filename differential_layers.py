@@ -90,32 +90,46 @@ class PriceImpactLayer(nn.Module):
     Price impact model with analytical derivatives.
     Implements square-root impact model.
 
-    FIX: impact_coefficient and gamma were previously raw, unconstrained
-    nn.Parameters. Verified by direct repro: under ordinary training
-    dynamics gamma can be driven negative (e.g. -1.8) within ~100 optimizer
-    steps. With ratio = order_size/volume often << 1 (predictions start
-    near zero), ratio**gamma for negative gamma explodes toward +/-inf
-    (e.g. loss diverged past 1e20 within 100 steps in testing), which is
-    exactly the mechanism behind the "Train Loss=nan" seen after a few
-    dozen epochs. gamma is now constrained to (0.05, 1.0) via a sigmoid
-    reparameterization, and impact_coefficient is constrained to be
-    positive via softplus — both are economically sensible ranges for a
-    price-impact exponent/coefficient and can no longer diverge.
+    FIX (round 1): impact_coefficient and gamma were previously raw,
+    unconstrained nn.Parameters, causing training divergence (verified:
+    gamma driven to -1.8 within ~100 steps, loss to 1e20).
+
+    FIX (round 2): the round-1 fix bounded gamma to (0.05, 1.0) via sigmoid,
+    but left impact_coefficient bounded only below (softplus, unbounded
+    above), and gamma's lower bound of 0.05 still leaves a nearly-singular
+    exponent (ratio^-0.95) as order_size -> 0. Once compute_differential_loss
+    started actually being used as a training objective, this combination
+    let the cost-sensitivity term explode: verified directly, with gamma
+    drifted toward 0.05 and impact_coefficient toward ~1.5-2 (both reachable
+    within ordinary gradient descent), the regularizer term was measured at
+    over 1000x the scale of the MSE loss it was meant to lightly regularize,
+    which explains the run where two universes' best validation epoch was
+    epoch 0 — training moved AWAY from a good solution as soon as this term
+    engaged.
+
+    Now BOTH gamma and impact_coefficient are bounded above and below via
+    sigmoid reparameterization, to economically sensible, training-stable
+    ranges. Combined with the d_total clamp in ExecutionCostLayer and the
+    rescaled differential-loss weight in DifferentialNetwork, this keeps
+    the regularizer from ever dominating the primary MSE objective.
     """
 
     def __init__(self, impact_coefficient: float = 0.1, gamma: float = 0.5,
-                 gamma_min: float = 0.05, gamma_max: float = 1.0):
+                 gamma_min: float = 0.3, gamma_max: float = 1.0,
+                 coeff_min: float = 0.001, coeff_max: float = 0.5):
         super().__init__()
         self.gamma_min = gamma_min
         self.gamma_max = gamma_max
+        self.coeff_min = coeff_min
+        self.coeff_max = coeff_max
 
-        # Inverse-sigmoid init so the constrained gamma starts at the requested value
         gamma_frac = (gamma - gamma_min) / (gamma_max - gamma_min)
         gamma_frac = min(max(gamma_frac, 1e-4), 1 - 1e-4)
         gamma_raw_init = np.log(gamma_frac / (1 - gamma_frac))
 
-        # Inverse-softplus init so constrained impact_coefficient starts at the requested value
-        coeff_raw_init = np.log(np.expm1(max(impact_coefficient, 1e-4)))
+        coeff_frac = (impact_coefficient - coeff_min) / (coeff_max - coeff_min)
+        coeff_frac = min(max(coeff_frac, 1e-4), 1 - 1e-4)
+        coeff_raw_init = np.log(coeff_frac / (1 - coeff_frac))
 
         self._gamma_raw = nn.Parameter(torch.tensor(gamma_raw_init, dtype=torch.float32))
         self._impact_coefficient_raw = nn.Parameter(torch.tensor(coeff_raw_init, dtype=torch.float32))
@@ -126,7 +140,7 @@ class PriceImpactLayer(nn.Module):
 
     @property
     def impact_coefficient(self) -> torch.Tensor:
-        return F.softplus(self._impact_coefficient_raw)
+        return self.coeff_min + (self.coeff_max - self.coeff_min) * torch.sigmoid(self._impact_coefficient_raw)
 
     def forward(self, order_size: torch.Tensor, volume: torch.Tensor) -> torch.Tensor:
         """
@@ -142,8 +156,13 @@ class PriceImpactLayer(nn.Module):
         Analytical derivative of square-root impact.
         d/d(order_size) [coeff * (order_size/volume)^gamma]
         = coeff * gamma * (order_size/volume)^(gamma-1) * (1/volume)
+
+        The ratio clamp floor is set relative to typical realistic ratios
+        (order_size ~ O(1e-3) predicted-return scale over volume ~ O(1e6))
+        rather than an arbitrary absolute epsilon, so the exponentiation
+        can't be driven to extreme values by unrealistically tiny inputs.
         """
-        ratio = (order_size / (volume + 1e-8)).clamp(min=1e-8)
+        ratio = (order_size / (volume + 1e-8)).clamp(min=1e-6)
         return self.impact_coefficient * self.gamma * (ratio ** (self.gamma - 1)) * (1 / (volume + 1e-8))
 
 
@@ -214,14 +233,22 @@ class ExecutionCostLayer(nn.Module):
                            volatility: torch.Tensor) -> Dict:
         """
         Compute analytical gradients of cost components.
+
+        d_total is clamped to a sane range as a defensive last resort —
+        even with impact_coefficient/gamma now bounded, this keeps a
+        single extreme sample from being able to dominate a batch's
+        differential-loss regularizer (see DifferentialNetwork.compute_
+        differential_loss for why that matters).
         """
         d_impact = self.impact_layer.analytical_derivative(order_size, volume)
         d_spread = self.spread_layer.analytical_derivative(volatility)
 
+        d_total = (d_impact + 0.5 * d_spread).clamp(max=5.0)
+
         return {
             "d_impact": d_impact,
             "d_spread": d_spread,
-            "d_total": d_impact + 0.5 * d_spread
+            "d_total": d_total
         }
 
 
@@ -317,16 +344,31 @@ class DifferentialNetwork(nn.Module):
     def compute_differential_loss(self, prediction: torch.Tensor,
                                   target: torch.Tensor,
                                   volume: torch.Tensor,
-                                  volatility: torch.Tensor) -> Dict:
+                                  volatility: torch.Tensor,
+                                  diff_loss_weight: float = 1e-4) -> Dict:
         """
         The actual "differential loss": standard MSE on the raw prediction
         vs. raw target, PLUS a regularization term that penalizes high
         execution-cost SENSITIVITY (the analytical gradient of cost w.r.t.
-        order size) — this is the project's namesake feature. Previously
-        this method existed but was never called anywhere in trainer.py;
-        the training loop called plain F.mse_loss on the cost-ADJUSTED
-        forward output instead, which both skipped this regularizer
-        entirely and caused the bias described in forward()'s docstring.
+        order size) — this is the project's namesake feature.
+
+        FIX: the original weight of 0.1 assumed d_total (and therefore
+        diff_loss = mean(d_total^2)) stays small. Verified directly: with
+        impact_coefficient/gamma at values reachable within ordinary
+        training (before this fix bounded them more tightly), diff_loss
+        was measured at ~11.75, so 0.1 * diff_loss ~= 1.18 — over 1000x the
+        scale of a typical ~0.0005 MSE loss on real return data. That
+        single term dominated total_loss and drove training in a direction
+        that had nothing to do with fitting returns (matching the observed
+        run where two universes' best validation epoch was epoch 0 — the
+        model got worse every epoch once this term engaged).
+
+        diff_loss_weight is now 1e-4 by default: combined with d_total's
+        clamp (max=5.0 in ExecutionCostLayer.analytical_gradient, i.e.
+        diff_loss <= 25), the regularizer's maximum possible contribution
+        is capped at 25 * 1e-4 = 0.0025 — comparable to, not orders of
+        magnitude larger than, typical MSE scale, so it can meaningfully
+        regularize without ever being able to hijack training.
         """
         # Standard MSE loss on the raw (unadjusted) prediction
         mse_loss = F.mse_loss(prediction, target)
@@ -341,7 +383,7 @@ class DifferentialNetwork(nn.Module):
         diff_loss = torch.mean(gradients["d_total"] ** 2)
 
         # Combined loss
-        total_loss = mse_loss + 0.1 * diff_loss
+        total_loss = mse_loss + diff_loss_weight * diff_loss
 
         return {
             "total_loss": total_loss,
