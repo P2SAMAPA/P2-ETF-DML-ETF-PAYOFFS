@@ -89,12 +89,44 @@ class PriceImpactLayer(nn.Module):
     """
     Price impact model with analytical derivatives.
     Implements square-root impact model.
+
+    FIX: impact_coefficient and gamma were previously raw, unconstrained
+    nn.Parameters. Verified by direct repro: under ordinary training
+    dynamics gamma can be driven negative (e.g. -1.8) within ~100 optimizer
+    steps. With ratio = order_size/volume often << 1 (predictions start
+    near zero), ratio**gamma for negative gamma explodes toward +/-inf
+    (e.g. loss diverged past 1e20 within 100 steps in testing), which is
+    exactly the mechanism behind the "Train Loss=nan" seen after a few
+    dozen epochs. gamma is now constrained to (0.05, 1.0) via a sigmoid
+    reparameterization, and impact_coefficient is constrained to be
+    positive via softplus — both are economically sensible ranges for a
+    price-impact exponent/coefficient and can no longer diverge.
     """
 
-    def __init__(self, impact_coefficient: float = 0.1, gamma: float = 0.5):
+    def __init__(self, impact_coefficient: float = 0.1, gamma: float = 0.5,
+                 gamma_min: float = 0.05, gamma_max: float = 1.0):
         super().__init__()
-        self.impact_coefficient = nn.Parameter(torch.tensor(impact_coefficient))
-        self.gamma = nn.Parameter(torch.tensor(gamma))
+        self.gamma_min = gamma_min
+        self.gamma_max = gamma_max
+
+        # Inverse-sigmoid init so the constrained gamma starts at the requested value
+        gamma_frac = (gamma - gamma_min) / (gamma_max - gamma_min)
+        gamma_frac = min(max(gamma_frac, 1e-4), 1 - 1e-4)
+        gamma_raw_init = np.log(gamma_frac / (1 - gamma_frac))
+
+        # Inverse-softplus init so constrained impact_coefficient starts at the requested value
+        coeff_raw_init = np.log(np.expm1(max(impact_coefficient, 1e-4)))
+
+        self._gamma_raw = nn.Parameter(torch.tensor(gamma_raw_init, dtype=torch.float32))
+        self._impact_coefficient_raw = nn.Parameter(torch.tensor(coeff_raw_init, dtype=torch.float32))
+
+    @property
+    def gamma(self) -> torch.Tensor:
+        return self.gamma_min + (self.gamma_max - self.gamma_min) * torch.sigmoid(self._gamma_raw)
+
+    @property
+    def impact_coefficient(self) -> torch.Tensor:
+        return F.softplus(self._impact_coefficient_raw)
 
     def forward(self, order_size: torch.Tensor, volume: torch.Tensor) -> torch.Tensor:
         """
