@@ -39,7 +39,7 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from data_manager import load_master_data, validate_data, prepare_features
+from data_manager import load_master_data, validate_data, prepare_features, filter_by_history
 from differential_layers import DifferentialNetwork
 from execution_models import ExecutionCostCalculator
 from payoff_functions import DiscontinuityAwareLoss
@@ -124,6 +124,27 @@ def run_trainer() -> Dict:
             logger.warning(f"No tickers available for {universe_name}")
             continue
 
+        # Exclude recently-listed tickers with insufficient history so they
+        # don't force the whole universe's usable training window down to
+        # their inception date (e.g. a universe with mostly 2004+ tickers
+        # was previously capped at ~6.5 years by a single 2018-listed ETF).
+        min_days = config.MIN_HISTORY_DAYS
+        available, excluded = filter_by_history(prices_df, available, min_days)
+
+        if excluded:
+            logger.info(
+                f"  Excluding {len(excluded)} recently-listed ticker(s) with < {min_days} "
+                f"trading days of history: " +
+                ", ".join(f"{t} ({n} days)" for t, n in excluded.items())
+            )
+
+        if len(available) < 2:
+            logger.warning(
+                f"Not enough long-history tickers left for {universe_name} "
+                f"({len(available)} remain after excluding short-history tickers) — skipping"
+            )
+            continue
+
         # Prepare features/targets: X is (n_days, n_tickers), Y is
         # (n_days, n_tickers) — one target per ticker, per day.
         try:
@@ -188,8 +209,17 @@ def run_trainer() -> Dict:
             config=config.DML_CONFIG
         ).to(device)
 
-        # Optimizer
-        optimizer = optim.Adam(model.parameters(), lr=config.DML_CONFIG["learning_rate"])
+        # Optimizer. weight_decay comes from config.DML_CONFIG["l2_reg"] — this
+        # was already defined in config.py but never actually applied anywhere,
+        # meaning the model had zero L2 regularization despite the config
+        # implying otherwise. With ~330 features and only ~1600 samples for
+        # the larger universes, this is very likely why validation loss
+        # peaked within the first 2-3 epochs in practice.
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=config.DML_CONFIG["learning_rate"],
+            weight_decay=config.DML_CONFIG.get("l2_reg", 0.0)
+        )
 
         # Training loop
         logger.info(f"  Training {len(dataloader)} batches for {config.DML_CONFIG['epochs']} epochs...")
@@ -216,7 +246,10 @@ def run_trainer() -> Dict:
                 # The actual "differential loss": MSE on the raw prediction
                 # PLUS a regularizer that penalizes high execution-cost
                 # SENSITIVITY. This was previously defined but never called.
-                loss_dict = model.compute_differential_loss(prediction, Y_batch, V_batch, Vol_batch)
+                loss_dict = model.compute_differential_loss(
+                    prediction, Y_batch, V_batch, Vol_batch,
+                    diff_loss_weight=config.DML_CONFIG.get("differential_weight", 1e-4)
+                )
                 loss = loss_dict["total_loss"]
 
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -243,7 +276,10 @@ def run_trainer() -> Dict:
             model.eval()
             with torch.no_grad():
                 val_pred, _ = model(X_val_t, V_val_t, Vol_val_t)
-                val_loss_dict = model.compute_differential_loss(val_pred, Y_val_t, V_val_t, Vol_val_t)
+                val_loss_dict = model.compute_differential_loss(
+                    val_pred, Y_val_t, V_val_t, Vol_val_t,
+                    diff_loss_weight=config.DML_CONFIG.get("differential_weight", 1e-4)
+                )
                 val_mse = val_loss_dict["mse_loss"].item()
             model.train()
 
@@ -280,6 +316,7 @@ def run_trainer() -> Dict:
             "best_epoch": best_epoch,
             "final_epoch_train_mse": avg_mse,
             "tickers": available,
+            "excluded_short_history": excluded,
             "samples": len(X)
         }
 
