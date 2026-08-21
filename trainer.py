@@ -173,6 +173,8 @@ def run_trainer() -> Dict:
         # Validation tensors
         X_val_t = torch.FloatTensor(X_val).to(device)
         Y_val_t = torch.FloatTensor(Y_val).to(device)
+        V_val_t = torch.FloatTensor(V_val).reshape(-1, 1).to(device)
+        Vol_val_t = torch.FloatTensor(Vol_val).reshape(-1, 1).to(device)
 
         # Create dataset
         dataset = TensorDataset(X_t, Y_t, V_t, Vol_t)
@@ -193,19 +195,29 @@ def run_trainer() -> Dict:
         logger.info(f"  Training {len(dataloader)} batches for {config.DML_CONFIG['epochs']} epochs...")
         model.train()
 
-        best_val_loss = float('inf')
-        avg_loss = float('inf')
+        best_val_mse = float('inf')
+        avg_mse = float('inf')
         best_model_state = None
+        best_epoch = 0
+        best_train_mse = float('inf')
 
         for epoch in range(config.DML_CONFIG["epochs"]):
-            epoch_loss = 0.0
+            epoch_mse = 0.0
+            epoch_diff = 0.0
+            n_batches_seen = 0
 
             for X_batch, Y_batch, V_batch, Vol_batch in dataloader:
                 optimizer.zero_grad()
 
+                # prediction is ALWAYS the raw return forecast now (never
+                # cost-adjusted) — see differential_layers.py's forward().
                 prediction, info = model(X_batch, V_batch, Vol_batch)
 
-                loss = F.mse_loss(prediction, Y_batch)
+                # The actual "differential loss": MSE on the raw prediction
+                # PLUS a regularizer that penalizes high execution-cost
+                # SENSITIVITY. This was previously defined but never called.
+                loss_dict = model.compute_differential_loss(prediction, Y_batch, V_batch, Vol_batch)
+                loss = loss_dict["total_loss"]
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     logger.warning(f"    Non-finite loss encountered at epoch {epoch} — skipping this batch's step")
@@ -218,37 +230,55 @@ def run_trainer() -> Dict:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
-                epoch_loss += loss.item()
+                epoch_mse += loss_dict["mse_loss"].item()
+                epoch_diff += loss_dict["diff_loss"].item()
+                n_batches_seen += 1
 
-            avg_loss = epoch_loss / len(dataloader)
+            avg_mse = epoch_mse / max(n_batches_seen, 1)
+            avg_diff = epoch_diff / max(n_batches_seen, 1)
 
-            # Validation
+            # Validation — same raw prediction pathway as training, so
+            # train and validation are directly comparable (no more
+            # cost-adjusted-vs-raw mismatch).
             model.eval()
             with torch.no_grad():
-                val_pred, _ = model(X_val_t, None, None)
-                val_loss = F.mse_loss(val_pred, Y_val_t).item()
+                val_pred, _ = model(X_val_t, V_val_t, Vol_val_t)
+                val_loss_dict = model.compute_differential_loss(val_pred, Y_val_t, V_val_t, Vol_val_t)
+                val_mse = val_loss_dict["mse_loss"].item()
             model.train()
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if val_mse < best_val_mse:
+                best_val_mse = val_mse
                 best_model_state = model.state_dict().copy()
+                best_epoch = epoch
+                best_train_mse = avg_mse  # train MSE AT the best epoch — directly comparable to best_val_mse
 
             if epoch % 20 == 0:
-                logger.info(f"    Epoch {epoch}: Train Loss={avg_loss:.6f}, Val Loss={val_loss:.6f}")
+                logger.info(
+                    f"    Epoch {epoch}: Train MSE={avg_mse:.6f} (+diff_loss={avg_diff:.6f}), "
+                    f"Val MSE={val_mse:.6f}"
+                )
 
         # Load best model
         if best_model_state is not None:
             model.load_state_dict(best_model_state)
 
         # Generate picks from the single most recent (normalized) day's
-        # features — an actual forecast for the next trading day.
+        # features — an actual forecast for the next trading day. The
+        # forecast is now always the raw (unadjusted) prediction, matching
+        # exactly what was optimized during training.
         latest_row = X_val[-1]
         picks = generate_picks(model, latest_row, feature_tickers, top_n=3)
 
-        # Store results
+        # Store results — train_mse is now reported AT the best (saved)
+        # epoch, so it's directly comparable to val_mse (previously "loss"
+        # was the LAST epoch's train loss, which could differ from the
+        # epoch actually used for the saved model/picks).
         results["universes"][universe_name] = {
-            "loss": avg_loss,
-            "best_val_loss": best_val_loss,
+            "train_mse_at_best_epoch": best_train_mse,
+            "best_val_mse": best_val_mse,
+            "best_epoch": best_epoch,
+            "final_epoch_train_mse": avg_mse,
             "tickers": available,
             "samples": len(X)
         }
