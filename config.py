@@ -53,8 +53,32 @@ EXECUTION_CONFIG = {
     "risk_aversion": 0.5,
 }
 
-# Windows for training
-WINDOWS = [63, 126, 252, 504]
+# Windows for training. Tied directly to PREDICTION_HORIZON_DAYS below: a
+# single window of the SAME length as the forecast horizon ("does the past
+# 21 days' momentum/vol predict the next 21 days' return") is a principled
+# choice, not an arbitrary one, and keeps feature count in check.
+#
+# FIX: previously [63, 126, 252, 504] (4 windows) gave larger universes far
+# more features than they had genuinely independent training examples for.
+# With a 21-day forecast horizon, adjacent training ROWS overlap ~95% (they
+# share 20 of 21 target days), so the count of effectively-independent
+# samples is ~total_samples/horizon, not total_samples. Verified on the
+# actual EQUITY_SECTORS run: ~171 effective independent samples vs. 307
+# features with 4 windows (ratio 0.56 -- fewer independent samples than
+# features, a mathematically underdetermined regime that explains the
+# instant-overfit collapse). With a single 21-day window: 109 features,
+# ratio 1.57 -- COMBINED goes from 0.46 to 1.32. FI_COMMODITIES (few
+# tickers) was already fine either way (2.51 -> 5.90, more margin still).
+WINDOWS = [21]
+
+# Target ratio of (effective independent samples) / (feature count) used to
+# scale L2/dropout regularization per-universe in trainer.py -- universes
+# that fall short of this target (typically the larger ones) get extra
+# regularization pressure proportional to how far short they are, up to
+# MAX_REG_SCALE. Universes already at or above this ratio (e.g.
+# FI_COMMODITIES) are left at the base l2_reg/dropout_rate.
+TARGET_EFFECTIVE_RATIO = 2.0
+MAX_REG_SCALE = 5.0
 
 # Minimum trading days of price history a ticker must have to be included
 # in training. Tickers below this are recently-listed and get excluded so
