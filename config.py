@@ -59,8 +59,11 @@ WINDOWS = [63, 126, 252, 504]
 # Minimum trading days of price history a ticker must have to be included
 # in training. Tickers below this are recently-listed and get excluded so
 # they don't drag the whole universe's usable date range down to their
-# inception date (see data_manager.filter_by_history for why). ~2500
-# trading days is roughly 10 years — comfortably more than the longest
-# rolling window above (504 days = ~2 years), so excluded tickers are
-# genuinely short-history, not just barely under the window requirement.
-MIN_HISTORY_DAYS = 2500
+# inception date (see data_manager.filter_by_history for why). Raised from
+# 2500 (~10y) to 3500 (~14y): at 2500, EQUITY_SECTORS/COMBINED still only
+# reached ~2331 usable samples (~9.25y) because a ~2015-vintage ETF cleared
+# the bar just barely and became the new binding constraint. 3500 trading
+# days requires a ~2012 or earlier listing date, pushing the common start
+# back toward the ~2004-2006 vintage sector ETFs that make up most of the
+# universe, much closer to FI_COMMODITIES's ~15-year window.
+MIN_HISTORY_DAYS = 3500
