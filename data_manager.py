@@ -179,7 +179,8 @@ def filter_by_history(prices_df: pd.DataFrame, tickers: List[str],
 
 
 def prepare_features(prices_df: pd.DataFrame, macro_df: pd.DataFrame,
-                      windows: Optional[List[int]] = None) -> tuple:
+                      windows: Optional[List[int]] = None,
+                      horizon: int = 1) -> tuple:
     """
     Prepare features for DML training.
 
@@ -195,16 +196,32 @@ def prepare_features(prices_df: pd.DataFrame, macro_df: pd.DataFrame,
     (pandas .rolling()/.diff() are inherently causal), so there is no
     look-ahead leakage.
 
-    Target Y (per day t): next-day (t+1) log return for EACH ticker —
-    shape (n_samples, n_tickers), matching X's row-days.
+    Target Y (per day t): cumulative log return over the NEXT `horizon`
+    trading days (t+1 through t+horizon) for EACH ticker — i.e. log(P_{t+horizon}/P_t).
+    horizon=1 (default) reproduces the original next-day-return target.
+
+    IMPORTANT — "latest row" for live prediction vs. training data are NOT
+    the same thing once horizon > 1. A row's TARGET can only be known once
+    `horizon` future days have actually happened, so the most recent ~horizon
+    rows are necessarily excluded from the training set (their target is
+    still in the future). But FEATURES only depend on past data, so the
+    single most recent trading day's feature vector is usually available
+    even though its target isn't — that's exactly the row you want to feed
+    the model for a live forecast. Using the training set's last row for
+    that (the old behavior) would silently forecast from data that's
+    `horizon - 1` trading days stale.
 
     Returns:
-        X:          (n_samples, n_features) unnormalized. Caller (trainer.py)
-                    normalizes using train-split-only statistics.
-        Y:          (n_samples, n_tickers)
-        volumes:    (n_samples,) proxy volume for the day, from raw returns only.
-        volatility: (n_samples,) proxy realized volatility, from raw returns only.
-        tickers:    list of ticker names, in the same column order as Y.
+        X:            (n_samples, n_features) unnormalized. Caller (trainer.py)
+                      normalizes using train-split-only statistics.
+        Y:            (n_samples, n_tickers), cumulative `horizon`-day forward return.
+        volumes:      (n_samples,) proxy volume for the day, from raw returns only.
+        volatility:   (n_samples,) proxy realized volatility, from raw returns only.
+        tickers:      list of ticker names, in the same column order as Y.
+        latest_row:   (n_features,) raw (unnormalized) feature vector for the
+                      most recent trading day with complete features — for
+                      live/current forecasting, NOT part of the training set.
+        latest_date:  the date corresponding to latest_row (for logging).
     """
     windows = windows or config.WINDOWS
     tickers = list(prices_df.columns)
@@ -231,14 +248,20 @@ def prepare_features(prices_df: pd.DataFrame, macro_df: pd.DataFrame,
 
     feat_df = pd.concat(feature_blocks, axis=1)
 
-    # Target: next-day return for EACH ticker, same date index as feat_df
-    target_df = returns.shift(-1)
+    # Target: cumulative return over the NEXT `horizon` trading days.
+    # shifted.iloc[t] = returns.iloc[t+1] (tomorrow's return, at row t)
+    # Then a REVERSED trailing-window sum turns that into a forward-looking
+    # sum: target.iloc[t] = sum(shifted.iloc[t : t+horizon])
+    #                     = sum(returns.iloc[t+1 : t+horizon+1])
+    #                     = log(P_{t+horizon} / P_t)   <- cumulative horizon-day return
+    shifted = returns.shift(-1)
+    target_df = shifted.iloc[::-1].rolling(window=horizon, min_periods=horizon).sum().iloc[::-1]
 
-    # A row is usable only if every feature AND every target is present.
-    # (This is where a late-inception ticker in the universe, or the
-    # rolling-window warm-up period, or the final row's missing next-day
-    # target, all get excluded.)
-    valid_mask = (~feat_df.isna().any(axis=1)) & (~target_df.isna().any(axis=1))
+    # Features and targets are valid for different (overlapping but not
+    # identical) reasons, so track them separately.
+    feat_valid_mask = ~feat_df.isna().any(axis=1)
+    target_valid_mask = ~target_df.isna().any(axis=1)
+    valid_mask = feat_valid_mask & target_valid_mask
 
     n_candidate = len(feat_df)
     n_valid = int(valid_mask.sum())
@@ -248,15 +271,17 @@ def prepare_features(prices_df: pd.DataFrame, macro_df: pd.DataFrame,
             f"Not enough valid rows after feature engineering: {n_valid} "
             f"(out of {n_candidate} candidate rows). This usually means a "
             f"ticker in this universe has a much shorter listing history "
-            f"than the rest, or the rolling windows {windows} are too long "
-            f"for the available data."
+            f"than the rest, the rolling windows {windows} are too long for "
+            f"the available data, or the horizon ({horizon} days) leaves too "
+            f"few rows with a fully-realized future target."
         )
 
     valid_dates = feat_df.index[valid_mask]
     logger.info(
         f"  Feature window: {valid_dates.min().date()} → {valid_dates.max().date()} "
-        f"({n_valid} usable rows out of {n_candidate} candidate rows, "
-        f"{n_candidate - n_valid} dropped to warm-up/missing-ticker/macro alignment) "
+        f"({n_valid} usable training rows out of {n_candidate} candidate rows, "
+        f"{n_candidate - n_valid} dropped to warm-up/missing-ticker/macro alignment/"
+        f"horizon={horizon}d target not yet realized) "
         f"| {feat_df.shape[1]} features (returns + rolling mom/vol + macro lvl/chg)"
     )
 
@@ -269,4 +294,15 @@ def prepare_features(prices_df: pd.DataFrame, macro_df: pd.DataFrame,
     volumes = np.abs(raw_ret_valid).mean(axis=1) * 1_000_000
     volatility = np.std(raw_ret_valid, axis=1)
 
-    return X, Y, volumes, volatility, tickers
+    # The single most recent day with a complete FEATURE row — regardless
+    # of whether its horizon-day-forward target is known yet — for live
+    # forecasting. This is almost always the actual last row of the dataset
+    # (features only need past data), unlike the training set's last valid
+    # row, which is necessarily ~horizon days stale.
+    if not feat_valid_mask.any():
+        raise ValueError("No row has a complete feature vector — cannot generate a live forecast.")
+    latest_idx = feat_valid_mask[feat_valid_mask].index[-1]
+    latest_row = feat_df.loc[latest_idx].values
+    latest_date = latest_idx
+
+    return X, Y, volumes, volatility, tickers, latest_row, latest_date
