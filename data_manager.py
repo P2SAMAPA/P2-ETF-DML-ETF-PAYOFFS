@@ -37,7 +37,7 @@ FIX vs original (prepare_features):
 import os
 import sys
 import logging
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from huggingface_hub import HfApi
@@ -144,6 +144,38 @@ def validate_data(prices: pd.DataFrame, macro: pd.DataFrame) -> None:
 
     if len(prices) < 252:
         logger.warning(f"Only {len(prices)} rows — less than 1 year of data.")
+
+
+def filter_by_history(prices_df: pd.DataFrame, tickers: List[str],
+                       min_days: int) -> Tuple[List[str], Dict[str, int]]:
+    """
+    Split `tickers` into those with at least `min_days` of actual price
+    history and those without (typically recently-listed ETFs).
+
+    This exists because prepare_features()'s joint-availability requirement
+    (a row is only usable if EVERY ticker has data that day) means a single
+    late-inception ticker in a universe silently drags the entire universe's
+    usable training window down to that ticker's listing date — e.g. XLC
+    (listed 2018) or XLRE (listed 2015) forcing a universe with mostly
+    2004+ tickers down to a ~6.5-year window. Filtering out the short-
+    history tickers BEFORE calling prepare_features lets the remaining
+    long-history tickers use their full available history.
+
+    Returns:
+        kept:    tickers with >= min_days of history, in original order.
+        dropped: {ticker: n_days_available} for tickers excluded, so the
+                 caller can log exactly what was excluded and why.
+    """
+    kept, dropped = [], {}
+    for t in tickers:
+        if t not in prices_df.columns:
+            continue
+        n_valid = int(prices_df[t].notna().sum())
+        if n_valid >= min_days:
+            kept.append(t)
+        else:
+            dropped[t] = n_valid
+    return kept, dropped
 
 
 def prepare_features(prices_df: pd.DataFrame, macro_df: pd.DataFrame,
