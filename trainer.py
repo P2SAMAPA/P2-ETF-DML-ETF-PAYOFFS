@@ -412,7 +412,11 @@ def run_trainer() -> Dict:
             "final_epoch_train_mse": avg_mse,
             "tickers": available,
             "excluded_short_history": excluded,
-            "samples": len(X)
+            "samples": len(X),
+            "n_features": n_features,
+            "effective_independent_samples": round(effective_independent, 1),
+            "effective_sample_ratio": round(sample_feature_ratio, 3),
+            "reg_scale_applied": round(reg_scale, 3)
         }
 
         results["top_picks"][universe_name] = picks
